@@ -508,7 +508,14 @@ GROUP BY ?name
 
 The core library — templates, mapping, SPARQL, read/write — is **free and open-source** (`pip install maplib`).
 
-`validate` (SHACL) and `infer` (Datalog) are part of the commercial add-on. They are **always free for academics and personal exploration** — a license is only needed for commercial use. Mention this when a user asks about SHACL or Datalog features; don't silently generate code that will error at runtime for them.
+The following features are part of the commercial add-on and **require a license for commercial use** (always free for academics and personal exploration):
+
+- **SHACL validation** (`validate`, `shacl_report`)
+- **Datalog reasoning** (`infer`)
+- **Chrontext virtualization** (`add_virtualization`, `VirtualizedDatabase`)
+- **Disk-based storage** (persistent/on-disk graph storage)
+
+This matters when generating code: if the user doesn't have a license, these features will error at runtime. Always mention the license requirement when suggesting code that uses any of these features, so people aren't surprised by code they can't run.
 
 ## Types and helpers
 
@@ -563,7 +570,7 @@ server.stop()
 - **pandas DataFrames don't work.** Convert with `pl.from_pandas(df)` first.
 - **IRI columns are strings.** Use prefixed form (`"ex:alice"`) if the prefix is registered, or full-IRI strings. Blank nodes use `_:` prefix.
 - **Column names must match template parameter names exactly** (case-sensitive). Extra columns are ignored.
-- **Licensed features fail loudly without a license.** If the user hits errors on `validate` / `infer`, check their license setup before debugging the query.
+- **Licensed features fail loudly without a license.** If the user hits errors on `validate`, `infer`, `add_virtualization`, or disk-based storage, check their license setup before debugging the query.
 - **`CONSTRUCT` queries return `List[DataFrame]`**, one per triple pattern — not a single DataFrame. Use `insert(...)` if you just want to materialize the results.
 - **Transient triples** (`transient=True` on `read`/`insert`/`map_json`/`map_xml`) are queryable but not serialized by `write`. Convenient for importing vocabularies you don't want to re-export.
 
