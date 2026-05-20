@@ -68,13 +68,14 @@ Key methods, grouped by what they do:
 | Purpose           | Method                                                       |
 |-------------------|--------------------------------------------------------------|
 | Templates         | `add_template`, `read_template`, `add_prefixes`              |
-| Map DataFrame → RDF | `map`, `map_triples`, `map_default`, `map_json`            |
+| Map DataFrame → RDF | `map`, `map_triples`, `map_default`, `map_json`, `map_xml` |
 | SPARQL            | `query`, `insert`, `update`                                  |
 | Read/write RDF    | `read`, `reads`, `write`, `writes`, `write_native_parquet`, `write_cim_xml` |
 | Validate (licensed) | `validate`, `shacl_report`                                 |
 | Reason (licensed) | `infer`                                                      |
-| Inspect           | `get_predicate_iris`, `get_predicate`, `explore`             |
-| Housekeeping      | `detach_graph`, `create_index`                               |
+| Inspect           | `get_predicate_iris`, `get_predicate`, `size`, `explore`     |
+| Housekeeping      | `detach_graph`, `truncate_graph`, `create_index`             |
+| Virtualization    | `add_virtualization`                                         |
 
 All `graph=` parameters default to the default graph when omitted. Pass an IRI string to target a named graph.
 
@@ -112,12 +113,18 @@ A few things to know:
 - Prefixes declared in the document are registered with the model.
 - Multiple templates can share a document; separate them with `.` on their own line.
 
+### Reading templates from file
+
+```python
+m.read_template("templates.stottr")   # reads stOTTR template(s) from a file
+```
+
 ### Building templates programmatically
 
 When the template shape depends on runtime metadata (e.g., generated from an ontology), construct it with Python objects instead of strings:
 
 ```python
-from maplib import Template, Instance, Parameter, Variable, IRI, RDFType, xsd
+from maplib import Template, Instance, Argument, Parameter, Variable, IRI, RDFType, xsd
 
 s, p, o = Variable("s"), Variable("p"), Variable("o")
 ex = "http://example.net/ns#"
@@ -127,6 +134,7 @@ tmpl = Template(
     parameters=[
         Parameter(Variable("id"), rdf_type=RDFType.IRI),
         Parameter(Variable("age"), rdf_type=RDFType.Literal(xsd.integer)),
+        Parameter(Variable("nickname"), optional=True, default_value=Literal("Unknown")),
     ],
     instances=[
         Instance(IRI("http://ns.ottr.xyz/0.4/Triple"),
@@ -134,6 +142,18 @@ tmpl = Template(
     ],
 )
 m.add_template(tmpl)
+```
+
+**`Parameter` fields:**
+- `variable` — the Variable
+- `optional` — can the variable be unbound? (default False)
+- `allow_blank` — can the variable be a blank node? (default True)
+- `rdf_type` — type annotation (e.g. `RDFType.IRI`, `RDFType.Literal(xsd.string)`)
+- `default_value` — default when no value provided (Literal, IRI, or BlankNode)
+
+**`Argument` class** — wraps a term for use in Instance arguments:
+```python
+Argument(term=Variable("x"), list_expand=True)  # marks for list expansion
 ```
 
 `generate_templates(model, graph=None)` can auto-generate one template per class in an RDFS/OWL ontology already loaded in the model.
@@ -146,6 +166,7 @@ m.add_template(tmpl)
 m.map("ex:Sensor", df)                         # template name + DataFrame
 m.map("ex:Sensor", df, graph="urn:g:sensors")  # into a named graph
 m.map("ex:NoArgsTemplate")                     # templates with no params
+m.map("ex:Sensor", df, validate_iris=False)     # skip IRI validation for speed
 ```
 
 The DataFrame's column names must match the template's parameter names (order doesn't matter). IRI columns should be strings like `"ex:alice"` or full IRIs in `<...>`-form.
@@ -179,8 +200,17 @@ print(template_str)            # the generated template, for inspection
 ### `map_json` — quick path for JSON data
 
 ```python
-m.map_json("doc.json")                # from file
-m.map_json('{"key": [1, 2, 3]}')      # from string
+m.map_json("doc.json")                         # from file
+m.map_json('{"key": [1, 2, 3]}')               # from string
+m.map_json("doc.json", transient=True)          # don't persist on write
+```
+
+### `map_xml` — quick path for XML data
+
+```python
+m.map_xml("doc.xml")                            # from file
+m.map_xml('<root><child>value</child></root>')   # from string
+m.map_xml("doc.xml", transient=True)             # don't persist on write
 ```
 
 ## Querying with SPARQL
@@ -214,12 +244,26 @@ m.update("""
 """)
 ```
 
-Useful extras on `query`:
+### `query` parameters
 
 - `solution_mappings=True` returns a `SolutionMappings` object (DataFrame + column RDF types). Pass it back into `m.map(..., data=sm)` for lossless round-trips.
 - `parameters={"var": sm}` binds a `SolutionMappings` as PVALUES — essentially external join keys.
 - `graph="urn:g:foo"` targets a named graph.
+- `streaming=True` — use Polars streaming for large results.
+- `return_json=True` — return results as a JSON string.
+- `include_transient=True` (default) — include transient triples in query scope.
+- `max_rows=N` — cap estimated result rows to avoid out-of-memory.
 - `debug=True` explains why a query returned no results.
+
+### `insert` parameters
+
+- `transient=True` — make the inserted triples transient (queryable but not serialized).
+- `source_graph` / `target_graph` — run the CONSTRUCT on `source_graph`, insert results into `target_graph`.
+- Also supports: `parameters`, `solution_mappings`, `streaming`, `include_transient`, `max_rows`, `debug`.
+
+### `update` parameters
+
+- Same as `query`: `parameters`, `streaming`, `include_transient`, `max_rows`, `debug`.
 
 ## Reading and writing RDF
 
@@ -241,7 +285,30 @@ m.write_cim_xml("model.xml", profile_graph="urn:graph:profiles",
                 version="22", description="My CIM model")
 ```
 
-Pass `transient=True` to `read` if the triples are just inputs for querying/validation and should not be re-serialized by `write`.
+### `read` / `reads` additional parameters
+
+- `transient=True` — triples available for query/validation but not serialized by `write`.
+- `parallel=True` — parse in parallel (defaults to True for NTriples). Assumes prefixes are at the top.
+- `checked=True` — validate IRIs (default True; set False for speed on trusted data).
+- `replace_graph=True` — replace the target graph entirely instead of adding to it.
+- `triples_batch_size=10_000_000` — batch size for reading large files.
+- `known_contexts={"url": "local_context"}` — resolve JSON-LD contexts locally.
+
+## Graph housekeeping
+
+```python
+# Get number of triples
+n = m.size()                               # default graph
+n = m.size(graph="urn:g:facts")            # named graph
+
+# Remove all triples from a graph
+m.truncate_graph()                         # default graph
+m.truncate_graph(graph="urn:g:temp")       # named graph
+
+# Detach a named graph into its own Model
+sub = m.detach_graph("urn:g:facts")
+sub = m.detach_graph("urn:g:facts", preserve_name=True)  # keep graph IRI
+```
 
 ## SHACL validation (requires license)
 
@@ -261,12 +328,23 @@ print(report.performance)           # per-shape timing
 print(report.rule_log)              # log of sh:rule executions
 ```
 
-Useful selectors:
+### `validate` parameters
 
-- `only_shapes=[iri, ...]` — validate a subset.
-- `deactivate_shapes=[iri, ...]` — validate everything except these.
+- `shape_graph` / `data_graph` — which graphs contain shapes vs data (both default to the default graph).
+- `report_graph` — if set, the validation report is placed in this named graph.
+- `inferences_graph` — if set, sh:rule inference results are placed in this named graph.
+- `include_details=True` — detailed evaluation info (uses more memory).
+- `include_conforms=True` — include passing results, not just violations.
+- `include_shape_graph=True` — include the shape graph in validation scope.
+- `only_shapes=[iri, ...]` — validate only these shapes.
+- `deactivate_shapes=[iri, ...]` — skip these shapes.
 - `dry_run=True` — find targets without evaluating constraints.
 - `max_shape_constraint_results=N` — cap results per shape (useful for huge data).
+- `streaming=True` — use Polars streaming.
+- `serial=True` — disable parallel validation of shapes.
+- `max_iterations=100_000` — cap iterations for SHACL rules (sh:rule).
+- `debug_rules=True` — explain why rules return no results (included in `rule_log`).
+- `max_rows=N` — cap estimated rows in underlying SPARQL results.
 
 ## Datalog reasoning (requires license)
 
@@ -283,7 +361,148 @@ ex:ancestor(?a, ?c) :- ex:parent(?a, ?b), ex:ancestor(?b, ?c) .
 inferred = m.infer(ruleset)   # materializes new triples into the graph
 ```
 
-`max_iterations` caps fixed-point iterations (default 100_000). `debug=True` explains empty-result rules.
+- `max_iterations` caps fixed-point iterations (default 100,000).
+- `max_results` caps total inferred triples (default 10,000,000).
+- `debug=True` explains empty-result rules.
+
+## Virtualization (chrontext)
+
+chrontext is maplib's time-series virtualization engine. It lets a single SPARQL query transparently span the in-memory knowledge graph and an external database (DuckDB, PostgreSQL, BigQuery, or OPC UA). maplib identifies which triple patterns belong to the graph and which need the database, pushes filters and aggregations down to SQL, and joins results via zero-copy Arrow DataFrames.
+
+### The three things chrontext needs
+
+1. **A database wrapper** — any Python object with a `query(sql: str) -> pl.DataFrame` method.
+2. **A `resource_sql_map`** — a dict mapping resource names to SQLAlchemy `Select` objects. Each query must produce columns named `id`, `timestamp`, and `value`.
+3. **Chrontext triples in the knowledge graph** — this is the critical part that's easy to get wrong.
+
+### The intermediate-node triple pattern (critical)
+
+Each entity that links to a time-series **must** have an intermediate node with exactly three predicates:
+
+```
+sensor  →  ct:hasTimeseries  →  ts_node
+ts_node →  ct:hasExternalId  →  "ST001_sensor_temperature"   (matches SQL id column)
+ts_node →  ct:hasResource    →  "temperature"                (matches resource_sql_map key)
+```
+
+Without `hasExternalId` and `hasResource`, chrontext silently returns zero rows — it discovers time-series by looking for these predicates on the intermediate node. This is the most common source of empty results.
+
+Build these triples with `map_triples`:
+
+```python
+ct_ns = "https://github.com/DataTreehouse/chrontext#"
+
+ts_link_rows, ts_extid_rows, ts_resource_rows = [], [], []
+for sensor_id, resource_name in sensor_resource_pairs:
+    ts_node = f"{ns}ts/{sensor_id}"
+    ts_link_rows.append({"subject": f"{ns}{sensor_id}", "object": ts_node})
+    ts_extid_rows.append({"subject": ts_node, "object": sensor_id})
+    ts_resource_rows.append({"subject": ts_node, "object": resource_name})
+
+m.map_triples(pl.DataFrame(ts_link_rows),     predicate=f"{ct_ns}hasTimeseries")
+m.map_triples(pl.DataFrame(ts_extid_rows),    predicate=f"{ct_ns}hasExternalId")
+m.map_triples(pl.DataFrame(ts_resource_rows), predicate=f"{ct_ns}hasResource")
+```
+
+### VirtualizedDatabase setup
+
+```python
+from maplib import VirtualizedDatabase, Prefix, Variable, Template, Parameter, RDFType, Triple, xsd
+from sqlalchemy import MetaData, Table, Column, select, literal_column
+
+# Database wrapper — any class with query(sql) -> pl.DataFrame
+class MyDuckDB:
+    def __init__(self, path):
+        self.con = duckdb.connect(path, read_only=True)
+        self.con.execute("SET TimeZone = 'UTC'")
+    def query(self, sql: str) -> pl.DataFrame:
+        return self.con.execute(sql).pl()
+
+db = MyDuckDB("data/mydb.duckdb")
+
+# SQLAlchemy table definition
+metadata = MetaData()
+measurements = Table("measurements", metadata,
+    Column("sensor_id"), Column("timestamp"), Column("value"),
+)
+
+# resource_sql_map — each entry must produce id, timestamp, value columns.
+# For DuckDB: use literal_column() with || for string concatenation
+# (SQLAlchemy's PostgreSQL dialect generates + which DuckDB rejects).
+def make_resource_sql(resource_name: str):
+    return select(
+        measurements.c.timestamp,
+        measurements.c.value,
+    ).select_from(measurements).add_columns(
+        literal_column(f"(measurements.sensor_id || '_sensor_{resource_name}')").label("id"),
+    )
+
+vdb = VirtualizedDatabase(
+    database=db,
+    resource_sql_map={"temperature": make_resource_sql("temperature")},
+    sql_dialect="postgres",
+)
+```
+
+### Resource templates
+
+Each resource needs a template describing how SQL rows become RDF triple patterns. The template has exactly **three parameters** (`id`, `timestamp`, `value`). The `dp` (data point) variable appears in the instances but is **not** a parameter — it's generated internally by chrontext:
+
+```python
+ct = Prefix("https://github.com/DataTreehouse/chrontext#")
+
+def make_ts_template(name: str) -> Template:
+    id_var, timestamp_var, value_var, dp_var = (
+        Variable("id"), Variable("timestamp"), Variable("value"), Variable("dp")
+    )
+    return Template(
+        iri=ct.suf(f"{name}TimeSeries"),
+        parameters=[
+            Parameter(variable=id_var,        rdf_type=RDFType.Literal(xsd.string)),
+            Parameter(variable=timestamp_var, rdf_type=RDFType.Literal(xsd.dateTime)),
+            Parameter(variable=value_var,     rdf_type=RDFType.Literal(xsd.double)),
+        ],
+        instances=[
+            Triple(id_var, ct.suf("hasDataPoint"), dp_var),
+            Triple(dp_var, ct.suf("hasValue"),     value_var),
+            Triple(dp_var, ct.suf("hasTimestamp"), timestamp_var),
+        ],
+    )
+```
+
+### Putting it together
+
+```python
+m.add_virtualization(
+    virtualized_database=vdb,
+    resources={
+        "temperature": make_ts_template("Temperature"),
+        "wind_speed":  make_ts_template("WindSpeed"),
+    },
+)
+```
+
+After this, `m.query()` transparently federates across both sources:
+
+```sparql
+SELECT ?name (AVG(?val) AS ?avg_val)
+WHERE {
+    ?sensor ex:name ?name .
+    ?sensor ct:hasTimeseries ?ts .
+    ?ts ct:hasDataPoint ?dp .
+    ?dp ct:hasTimestamp ?t ;
+        ct:hasValue     ?val .
+}
+GROUP BY ?name
+```
+
+### Chrontext gotchas
+
+- **Empty results, no error**: Almost always means the `ct:hasExternalId` / `ct:hasResource` triples are missing or the values don't match `resource_sql_map` keys / SQL id column. Use `RUST_LOG=debug` to see chrontext's internal static query.
+- **DuckDB string concatenation**: DuckDB uses `||`, not `+`. SQLAlchemy's PostgreSQL dialect generates `+` for string concat. Use `literal_column("(col1 || col2)")` to write raw SQL.
+- **`Prefix()` without name**: For chrontext's namespace, use `Prefix("https://...#")` (one argument). The two-argument form `Prefix("url", "name")` is for registered prefixes.
+- **`dp` is not a parameter**: The data-point variable appears in template instances but must NOT be listed in parameters. Only `id`, `timestamp`, and `value` are parameters.
+- **`sql_dialect="postgres"`**: Use this for DuckDB — it's the closest match in SQLAlchemy's dialect system.
 
 ## Licensing note
 
@@ -299,14 +518,18 @@ from maplib import IRI, Literal, BlankNode, Prefix, RDFType, xsd, rdf, rdfs, owl
 IRI("http://example.net/ns#alice")
 Literal("34", data_type=xsd.integer)
 Literal("Alice", language="en")
+Literal("34", data_type=xsd.integer).to_native()  # -> 34 (Python int)
 BlankNode("b1")                              # blank node
 
 ex = Prefix("http://example.net/ns#", "ex")
 ex.suf("name")                               # -> IRI("http://example.net/ns#name")
 
-RDFType.IRI
-RDFType.Literal(xsd.string)
+RDFType.IRI                                  # IRI column
+RDFType.BlankNode                            # blank node column
+RDFType.Literal(xsd.string)                  # typed literal
 RDFType.Nested(RDFType.Literal(xsd.integer)) # list of integers
+RDFType.Multi([RDFType.IRI, RDFType.Literal(xsd.string)])  # mixed types
+RDFType.Unknown                              # untyped
 ```
 
 Built-in namespaces: `xsd`, `rdf`, `rdfs`, `owl`. Use them for common IRIs instead of spelling out the URL.
@@ -327,10 +550,12 @@ from maplib import IndexingOptions
 m.create_index(IndexingOptions(object_sort_all=True))
 
 # Live exploration (spins up a local web UI)
-server = m.explore(port=8000, popup=False)
+server = m.explore(port=8000, popup=False, graph="urn:g:facts")
 # ...
 server.stop()
 ```
+
+`explore` additional parameters: `fts=True` (full-text search), `fts_path="fts"` (index path), `graph=` (which graph to explore), `page=` (frontend variant, try `"new"` or `"yasgui"`).
 
 ## Common gotchas
 
@@ -340,7 +565,7 @@ server.stop()
 - **Column names must match template parameter names exactly** (case-sensitive). Extra columns are ignored.
 - **Licensed features fail loudly without a license.** If the user hits errors on `validate` / `infer`, check their license setup before debugging the query.
 - **`CONSTRUCT` queries return `List[DataFrame]`**, one per triple pattern — not a single DataFrame. Use `insert(...)` if you just want to materialize the results.
-- **Transient triples** (`transient=True` on `read`/`insert`) are queryable but not serialized by `write`. Convenient for importing vocabularies you don't want to re-export.
+- **Transient triples** (`transient=True` on `read`/`insert`/`map_json`/`map_xml`) are queryable but not serialized by `write`. Convenient for importing vocabularies you don't want to re-export.
 
 ## Reference workflow — DataFrame in, knowledge graph, DataFrame out
 
