@@ -72,7 +72,7 @@ Key methods, grouped by what they do:
 | SPARQL            | `query`, `insert`, `update`                                  |
 | Read/write RDF    | `read`, `reads`, `write`, `writes`, `write_native_parquet`, `write_cim_xml` |
 | Validate (licensed) | `validate`, `shacl_report`                                 |
-| Reason (licensed) | `infer`                                                      |
+| Reason (licensed) | `infer` — Datalog **and** recursive SPARQL CONSTRUCT         |
 | Inspect           | `get_predicate_iris`, `get_predicate`, `size`, `explore`     |
 | Housekeeping      | `detach_graph`, `truncate_graph`, `create_index`             |
 | Virtualization    | `add_virtualization`                                         |
@@ -230,7 +230,7 @@ dfs = m.query("""
     CONSTRUCT { ?s a ex:NamedThing } WHERE { ?s ex:name ?n }
 """)
 
-# INSERT — mutates the graph, returns None
+# INSERT — mutates the graph, returns None. Single pass, NOT recursive.
 m.insert("""
     PREFIX ex:<http://example.net/ns#>
     CONSTRUCT { ?p a ex:Adult }
@@ -243,6 +243,8 @@ m.update("""
     DELETE { ?s ex:tempFlag ?f } WHERE { ?s ex:tempFlag ?f }
 """)
 ```
+
+> For **recursive** CONSTRUCT (re-applied to a fixed point), use `infer`, not `insert` — see "Reasoning with `infer`" below.
 
 ### `query` parameters
 
@@ -346,9 +348,40 @@ print(report.rule_log)              # log of sh:rule executions
 - `debug_rules=True` — explain why rules return no results (included in `rule_log`).
 - `max_rows=N` — cap estimated rows in underlying SPARQL results.
 
-## Datalog reasoning (requires license)
+## Reasoning with `infer` (requires license)
 
-`infer` applies a Datalog ruleset. Rules share maplib's prefix table (`add_prefixes`).
+`infer` runs **closed-world, recursive, fixed-point** reasoning. It applies a ruleset to the graph, materializes the derived triples, and re-applies the rules to those new triples until nothing new is produced (a fixed point). It accepts **two kinds of rules, which you can mix in one call**:
+
+1. **Datalog rules**
+2. **SPARQL `CONSTRUCT` queries**
+
+Pass a single rule string, or a list of rule strings — all are evaluated together to a shared fixed point, so rules can feed each other recursively.
+
+```python
+inferred = m.infer(ruleset)              # one ruleset string
+inferred = m.infer([rule_a, rule_b])     # list of rules, evaluated together
+```
+
+`infer` **materializes** the new triples into the graph and **returns** `Optional[Dict[str, polars.DataFrame]]` — the inferred tuples keyed by predicate. The return value is not a triple count; use `m.size()` before/after if you want a count.
+
+Rules share maplib's prefix table (`add_prefixes`) and may also declare their own `@prefix` / `PREFIX`.
+
+### Datalog rules — two equivalent syntaxes
+
+**Triple-pattern form** (`[subject, predicate, object]`) — the most expressive; prefer this for anything non-trivial:
+
+```python
+rules = """
+PREFIX ex: <http://example.net/ns#>
+
+# head :- body .   (body atoms are comma-separated)
+[?a, ex:ancestor, ?c] :- [?a, ex:parent, ?c] .
+[?a, ex:ancestor, ?c] :- [?a, ex:parent, ?b], [?b, ex:ancestor, ?c] .
+"""
+m.infer(rules)
+```
+
+**Predicate form** (`pred(args)`) — compact for simple cases:
 
 ```python
 ruleset = """
@@ -357,13 +390,73 @@ ruleset = """
 ex:ancestor(?a, ?c) :- ex:parent(?a, ?c) .
 ex:ancestor(?a, ?c) :- ex:parent(?a, ?b), ex:ancestor(?b, ?c) .
 """
-
-inferred = m.infer(ruleset)   # materializes new triples into the graph
+m.infer(ruleset)
 ```
 
-- `max_iterations` caps fixed-point iterations (default 100,000).
-- `max_results` caps total inferred triples (default 10,000,000).
-- `debug=True` explains empty-result rules.
+The triple-pattern form supports richer rule bodies:
+
+- **Multiple heads** — derive several triples from one rule by listing comma-separated heads before `:-`.
+- **`FILTER(...)`** — SPARQL-style filter expressions (`!=`, `<`, `&&`, etc.).
+- **`NOT EXISTS ?v IN ( ... )`** — negation-as-failure over a sub-pattern, scoped to variable `?v`.
+- **Recursion** — a predicate may appear in both head and body; the engine iterates to a fixed point.
+
+```python
+rules = """
+PREFIX ex: <http://example.net/ns#>
+
+# multi-head: symmetric closure
+[?x, ex:related, ?y], [?y, ex:related, ?x] :-
+    [?x, ex:sameOwnerAs, ?y],
+    FILTER(?x != ?y) .
+
+# recursive transitive closure with negation-as-failure
+[?x, ex:related, ?z] :-
+    [?x, ex:related, ?y],
+    [?y, ex:related, ?z],
+    NOT EXISTS ?blocked IN ( [?x, ex:blocks, ?z] ),
+    FILTER(?x != ?z) .
+"""
+m.infer(rules)
+```
+
+### SPARQL CONSTRUCT rules
+
+A `CONSTRUCT` query can be used directly as an inference rule. Unlike `insert` (which runs the CONSTRUCT exactly once), `infer` applies it **recursively to a fixed point**, so CONSTRUCT-derived triples can trigger further inference:
+
+```python
+construct_rule = """
+PREFIX ex: <http://example.net/ns#>
+CONSTRUCT { ?a ex:ancestor ?c }
+WHERE {
+    ?a ex:parent ?b .
+    ?b ex:ancestor ?c .
+}
+"""
+m.infer(construct_rule)            # recursive: re-applied until no new triples
+```
+
+You can mix CONSTRUCT and Datalog rules in a single call:
+
+```python
+m.infer([datalog_rule, construct_rule])
+```
+
+### `infer` vs `insert` — which to use
+
+- **`infer`** (licensed) — recursive, fixed-point reasoning. Use when derived triples should themselves trigger more derivation: transitive closures, type/class hierarchies, graph-navigation shortcuts. Accepts Datalog and/or recursive CONSTRUCT.
+- **`insert`** (free core) — a single CONSTRUCT-then-insert pass, no recursion. Use for one-shot enrichment, e.g. flagging adults or computing a per-entity summary.
+
+This distinction is the most common source of confusion: a recursive intent (e.g. "everyone reachable through `parent`") needs `infer`, not `insert`.
+
+### `infer` parameters
+
+- `ruleset` — a rule string **or a list of rule strings** (`Union[str, List[str]]`); Datalog and/or SPARQL CONSTRUCT.
+- `graph` — apply rules to this graph (defaults to the default graph, or the graph named in the rules).
+- `max_iterations=100_000` — cap on fixed-point iterations.
+- `max_results=10_000_000` — cap on total inferred triples.
+- `include_transient=True` — include transient triples when reasoning.
+- `max_rows=100_000_000` — cap estimated rows to avoid out-of-memory.
+- `debug=True` — explains rule bodies that produce no triples.
 
 ## Virtualization (chrontext)
 
@@ -508,14 +601,7 @@ GROUP BY ?name
 
 The core library — templates, mapping, SPARQL, read/write — is **free and open-source** (`pip install maplib`).
 
-The following features are part of the commercial add-on and **require a license for commercial use** (always free for academics and personal exploration):
-
-- **SHACL validation** (`validate`, `shacl_report`)
-- **Datalog reasoning** (`infer`)
-- **Chrontext virtualization** (`add_virtualization`, `VirtualizedDatabase`)
-- **Disk-based storage** (persistent/on-disk graph storage)
-
-This matters when generating code: if the user doesn't have a license, these features will error at runtime. Always mention the license requirement when suggesting code that uses any of these features, so people aren't surprised by code they can't run.
+`validate` (SHACL) and `infer` (Datalog **and** recursive SPARQL CONSTRUCT reasoning) are part of the commercial add-on. They are **always free for academics and personal exploration** — a license is only needed for commercial use. Mention this when a user asks about SHACL or reasoning features; don't silently generate code that will error at runtime for them. Note that single-pass `insert` (CONSTRUCT-then-insert) is part of the free core — only recursive, fixed-point reasoning via `infer` is licensed.
 
 ## Types and helpers
 
@@ -567,11 +653,13 @@ server.stop()
 ## Common gotchas
 
 - **Wrong class name.** The class is `Model`. Older tutorials (including some earlier Data Treehouse articles) use `Mapping`, `expand`, or `m = Mapping("ontology.ttl")`. That API is outdated — do not copy it. Always `from maplib import Model` and call `m.add_template(...)` + `m.map(...)`.
+- **`infer` is recursive; `insert` is not.** `infer` does fixed-point reasoning over Datalog rules and/or SPARQL CONSTRUCT queries (licensed). `insert` runs a CONSTRUCT exactly once (free). Reach for `infer` whenever derived triples should trigger more derivation.
+- **`infer` returns inferred tuples, not a count.** The return type is `Optional[Dict[str, DataFrame]]` and the triples are materialized into the graph. Use `m.size()` deltas for a count.
 - **pandas DataFrames don't work.** Convert with `pl.from_pandas(df)` first.
 - **IRI columns are strings.** Use prefixed form (`"ex:alice"`) if the prefix is registered, or full-IRI strings. Blank nodes use `_:` prefix.
 - **Column names must match template parameter names exactly** (case-sensitive). Extra columns are ignored.
-- **Licensed features fail loudly without a license.** If the user hits errors on `validate`, `infer`, `add_virtualization`, or disk-based storage, check their license setup before debugging the query.
-- **`CONSTRUCT` queries return `List[DataFrame]`**, one per triple pattern — not a single DataFrame. Use `insert(...)` if you just want to materialize the results.
+- **Licensed features fail loudly without a license.** If the user hits errors on `validate` / `infer`, check their license setup before debugging the query.
+- **`CONSTRUCT` queries return `List[DataFrame]`**, one per triple pattern — not a single DataFrame. Use `insert(...)` to materialize once, or `infer(...)` to materialize recursively.
 - **Transient triples** (`transient=True` on `read`/`insert`/`map_json`/`map_xml`) are queryable but not serialized by `write`. Convenient for importing vocabularies you don't want to re-export.
 
 ## Reference workflow — DataFrame in, knowledge graph, DataFrame out
@@ -593,7 +681,7 @@ for name, df in my_dataframes.items():
 report = m.validate(shape_graph="urn:g:shapes")
 assert report.conforms, report.results()
 
-# Enrich with inference
+# Enrich with recursive, fixed-point reasoning (Datalog and/or CONSTRUCT rules)
 m.infer(open("rules.datalog").read())
 
 # Feed results back into analytics
