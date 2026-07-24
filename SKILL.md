@@ -61,18 +61,23 @@ from maplib import Model, IndexingOptions
 
 m = Model()                          # empty model, default indexing
 m = Model(indexing_options=IndexingOptions(object_sort_all=True))
+m = Model(storage_folder="disk")     # spill triples to disk instead of RAM
 ```
+
+Pass `storage_folder=` to back the model with on-disk storage (see "On-disk storage & serialization" below) instead of keeping every triple in memory.
 
 Key methods, grouped by what they do:
 
 | Purpose           | Method                                                       |
 |-------------------|--------------------------------------------------------------|
-| Templates         | `add_template`, `read_template`, `add_prefixes`              |
-| Map DataFrame → RDF | `map`, `map_triples`, `map_default`, `map_json`, `map_xml` |
-| SPARQL            | `query`, `insert`, `update`                                  |
+| Templates         | `add_template`, `read_template`, `add_prefixes`, `get_templates`, `templates_to_graph` |
+| Map DataFrame → RDF | `map`, `map_triples`, `map_default`, `map_df`, `map_json`, `map_xml`, `map_opc_ua` |
+| SPARQL            | `query`, `query_external`, `insert`, `update`               |
+| SPARQL functions  | `add_udf`, `list_udfs`                                       |
 | Read/write RDF    | `read`, `reads`, `write`, `writes`, `write_native_parquet`, `write_cim_xml` |
+| Persist/restore   | `serialize`, `deserialize`, `compact`                       |
 | Validate (licensed) | `validate`, `shacl_report`                                 |
-| Reason (licensed) | `infer` — Datalog **and** recursive SPARQL CONSTRUCT         |
+| Reason            | `infer` (licensed) — Datalog **and** recursive SPARQL CONSTRUCT; `infer_rdfs` — built-in RDFS |
 | Inspect           | `get_predicate_iris`, `get_predicate`, `size`, `explore`     |
 | Housekeeping      | `detach_graph`, `truncate_graph`, `create_index`             |
 | Virtualization    | `add_virtualization`                                         |
@@ -117,6 +122,13 @@ A few things to know:
 
 ```python
 m.read_template("templates.stottr")   # reads stOTTR template(s) from a file
+```
+
+### Inspecting templates
+
+```python
+templates = m.get_templates()   # -> List[Template] currently registered
+m.templates_to_graph()          # materialize the templates themselves as RDF (e.g. to query/serialize them)
 ```
 
 ### Building templates programmatically
@@ -213,6 +225,23 @@ m.map_xml('<root><child>value</child></root>')   # from string
 m.map_xml("doc.xml", transient=True)             # don't persist on write
 ```
 
+### `map_df` — one-shot Facade-X mapping of a wide DataFrame
+
+Even simpler than `map_default`: hands the whole DataFrame to maplib's Facade-X (CSV-style) mapper, no template or primary key needed. Good for a quick "just turn this table into triples":
+
+```python
+df = pl.read_csv("my_csv.csv")
+m.map_df(df)                                    # or m.map_df(df, graph="urn:g:raw")
+```
+
+### `map_opc_ua` — map OPC UA NodeSet2 XMLs
+
+Maps a folder of OPC UA NodeSet2 XML files to RDF. The folder **must** include the Namespace 0 XML:
+
+```python
+m.map_opc_ua("my_opc_ua_nodeset2_xmls", graph="urn:maplib:uagraphs")
+```
+
 ## Querying with SPARQL
 
 `query` runs SELECT / CONSTRUCT. `insert` runs CONSTRUCT-then-insert. `update` runs SPARQL UPDATE.
@@ -267,9 +296,52 @@ m.update("""
 
 - Same as `query`: `parameters`, `streaming`, `include_transient`, `max_rows`, `debug`.
 
+### `query_external` — federate to a remote SPARQL endpoint
+
+Runs a SELECT against an external HTTP SPARQL endpoint (GET, JSON results) and returns a Polars DataFrame, just like a local `query`. Only SELECT is supported.
+
+```python
+df = m.query_external(
+    """
+    PREFIX ex:<http://example.net/ns#>
+    SELECT ?obj1 ?obj2 WHERE { ?obj1 ex:hasObj ?obj2 }
+    """,
+    "http://localhost:8000/query",   # the external endpoint
+)
+```
+
+Parameters: `solution_mappings=True` (return `SolutionMappings`), `return_json=True` (return a JSON string).
+
+## User-defined SPARQL functions (`add_udf`)
+
+Register a Python callable as a custom SPARQL function, then call it inside queries with `BIND(<iri>(?arg) AS ?out)`. The callable receives a Polars DataFrame whose columns are named by argument position (`"0"`, `"1"`, …), adds an output column, and returns the DataFrame:
+
+```python
+import polars as pl
+
+def find_abc(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns(pl.col("0").str.contains("abc").alias("out"))
+
+m.add_udf(
+    "urn:maplib:findabc",            # the function IRI
+    find_abc,                        # (DataFrame) -> DataFrame
+    xsd.boolean,                     # output_type: RDFType, IRI, or str
+    [xsd.string],                    # input_types (optional)
+)
+
+result = m.query("""
+    SELECT * {
+        ?a <urn:maplib:hasstr> ?s1 .
+        BIND(<urn:maplib:findabc>(?s1) AS ?found)
+    }
+""")
+
+m.list_udfs()                        # -> list of registered UDF IRIs
+```
+
 ## Reading and writing RDF
 
-maplib handles `ntriples`, `turtle`, `rdf/xml`, `cim/xml`, and `json-ld`. Format is inferred from the file extension unless you pass `format=`.
+maplib **reads** `ntriples`, `turtle`, `rdf/xml`, `cim/xml`, `json-ld`, and `hdt`. It **writes** `ntriples`, `turtle`, `rdf/xml`, and `hdt` via `write`/`writes` — `cim/xml` is written with `write_cim_xml`, and `json-ld` is read-only. Format is inferred from the file extension unless you pass `format=`.
 
 ```python
 # Read
@@ -295,6 +367,26 @@ m.write_cim_xml("model.xml", profile_graph="urn:graph:profiles",
 - `replace_graph=True` — replace the target graph entirely instead of adding to it.
 - `triples_batch_size=10_000_000` — batch size for reading large files.
 - `known_contexts={"url": "local_context"}` — resolve JSON-LD contexts locally.
+
+## On-disk storage & serialization
+
+For graphs too large to hold in RAM, back the model with disk storage, and persist/restore the full model state between sessions.
+
+```python
+# Spill triples to disk instead of memory
+m = Model(storage_folder="disk")
+
+# Serialize all named graphs to a folder ...
+m.serialize("serialized")
+
+# ... and restore later (optionally straight onto disk storage)
+m2 = Model.deserialize("serialized", storage_folder="disk")
+
+# Compact on-disk storage after heavy churn
+m.compact()
+```
+
+`serialize`/`deserialize` round-trip the model's own native format (fastest, lossless) — distinct from `write_native_parquet` (columnar Parquet export) and from RDF serialization via `write`. Use `serialize` when you want to checkpoint a working model and reload it as-is.
 
 ## Graph housekeeping
 
@@ -457,6 +549,16 @@ This distinction is the most common source of confusion: a recursive intent (e.g
 - `include_transient=True` — include transient triples when reasoning.
 - `max_rows=100_000_000` — cap estimated rows to avoid out-of-memory.
 - `debug=True` — explains rule bodies that produce no triples.
+
+### `infer_rdfs` — built-in RDFS reasoning
+
+For plain RDFS entailment you don't need to write rules — `infer_rdfs` applies the standard RDFS rules (2, 3, 5, 6, 8, 9, 10, 11: domain/range typing, subPropertyOf and subClassOf transitivity and instance propagation) and returns the number of inferred triples:
+
+```python
+n = m.infer_rdfs()                 # or m.infer_rdfs(graph="urn:g:facts")
+```
+
+The triples it derives are **transient** — queryable but not serialized by `write`. Unlike `infer`, this is a fixed built-in ruleset (no custom rules, no CONSTRUCT).
 
 ## Virtualization (chrontext)
 
@@ -640,7 +742,9 @@ sub = m.detach_graph("urn:g:facts")
 
 # Opt into heavier object indexing
 from maplib import IndexingOptions
-m.create_index(IndexingOptions(object_sort_all=True))
+m.create_index(IndexingOptions(object_sort_all=True))          # all graphs
+m.create_index(IndexingOptions(object_sort_all=True),
+               all=False, graph="urn:g:facts")                 # one graph only
 
 # Live exploration (spins up a local web UI)
 server = m.explore(port=8000, popup=False, graph="urn:g:facts")
